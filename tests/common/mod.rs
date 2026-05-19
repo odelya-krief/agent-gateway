@@ -17,8 +17,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use x509_parser::prelude::*;
 
-use agent_gateway::policy::PolicyEngine;
+use async_trait::async_trait;
+use agent_gateway::config::RateLimitConfig;
+use agent_gateway::policy::{PolicyDecision, PolicyEngine, RequestContext};
 use agent_gateway::proxy::MakeProxyService;
+use agent_gateway::rate_limit;
+
+pub struct AllowAllPolicyEngine {
+    pub identity: String,
+}
+
+#[async_trait]
+impl PolicyEngine for AllowAllPolicyEngine {
+    async fn evaluate(&self, _ctx: &RequestContext) -> PolicyDecision {
+        PolicyDecision::Allow {
+            source_identity: self.identity.clone(),
+        }
+    }
+}
 
 const CLIENT_EXTENSION_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 1];
 static TEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -711,7 +727,10 @@ pub async fn start_proxy(
 
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
-    let make_service = Arc::new(MakeProxyService::new(policy_engine));
+    let make_service = Arc::new(MakeProxyService::new(
+        policy_engine,
+        agent_gateway::rate_limit::apply(&Default::default()),
+    ));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -732,6 +751,59 @@ pub async fn start_proxy(
                             error = %e,
                             "TLS handshake failed"
                         );
+                        return;
+                    }
+                };
+                let peer_certs = agent_gateway::proxy::extract_peer_certs(tls_stream.get_ref().1);
+                let service = svc.make_service(peer_certs, peer);
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .http2_only()
+                .serve_connection_with_upgrades(io, service)
+                .await;
+            });
+        }
+    });
+
+    (addr, ServerGuard { task })
+}
+
+pub async fn start_proxy_with_rate_limit(
+    pki: &TestPki,
+    policy_engine: Arc<dyn PolicyEngine>,
+    rate_limit_config: RateLimitConfig,
+) -> (SocketAddr, ServerGuard) {
+    install_test_crypto_provider();
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(agent_gateway::tls::db_rooted_client_cert_verifier())
+        .with_single_cert(pki.server_cert_chain(), pki.server_key_der())
+        .unwrap();
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let make_service = Arc::new(MakeProxyService::new(
+        policy_engine,
+        rate_limit::apply(&rate_limit_config),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, peer)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = tls_acceptor.clone();
+            let svc = make_service.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(tcp).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(source_peer_addr = %peer, error = %e, "TLS handshake failed");
                         return;
                     }
                 };

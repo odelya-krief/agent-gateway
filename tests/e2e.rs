@@ -1,11 +1,13 @@
 mod common;
 
 use common::{
-    TestPki, TestPolicyEngine, allocate_closed_port, connect_client_with_cert, drain_events,
-    find_event, generate_client_cert, generate_client_cert_no_extension, init_tracing_capture,
-    install_test_crypto_provider, postgres_engine_allowing, serial_test_lock, start_echo_server,
-    start_proxy, try_request_with_tls_config, unique_test_identity, wait_for_event,
+    AllowAllPolicyEngine, TestPki, TestPolicyEngine, allocate_closed_port, connect_client_with_cert,
+    drain_events, find_event, generate_client_cert, generate_client_cert_no_extension,
+    init_tracing_capture, install_test_crypto_provider, postgres_engine_allowing, serial_test_lock,
+    start_echo_server, start_proxy, start_proxy_with_rate_limit, try_request_with_tls_config,
+    unique_test_identity, wait_for_event,
 };
+use agent_gateway::config::RateLimitConfig;
 use http_body_util::Empty;
 use hyper::Request;
 use rustls::client::ResolvesClientCert;
@@ -522,4 +524,46 @@ async fn mtls_accepts_untrusted_ca_but_policy_denies_unregistered_key() {
         "denial should be caused by missing key-bound permission, got: {reason}"
     );
     policy.cleanup().await;
+}
+
+#[tokio::test]
+async fn rate_limit_blocks_after_limit_exceeded() {
+    let _guard = serial_test_lock().await;
+    let log = init_tracing_capture();
+    drain_events(&log);
+
+    let (echo_addr, _echo_guard) = start_echo_server().await;
+    let dest = format!("127.0.0.1:{}", echo_addr.port());
+
+    let pki = TestPki::new("test-agent");
+    let engine = Arc::new(AllowAllPolicyEngine { identity: "test-agent".to_owned() });
+
+    // 10 byte limit — sending "hello world" (11 bytes) will exceed it
+    let (proxy_addr, _proxy_guard) = start_proxy_with_rate_limit(
+        &pki,
+        engine,
+        RateLimitConfig { enabled: true, bytes_per_window: 10, window_secs: None },
+    ).await;
+
+    let mut send_req = common::connect_client(proxy_addr, &pki).await;
+
+    // First connection: send 11 bytes through the echo tunnel
+    let req = Request::connect(&dest).body(Empty::<bytes::Bytes>::new()).unwrap();
+    let resp = send_req.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200, "first connection should be allowed");
+
+    let upgraded = hyper::upgrade::on(resp).await.unwrap();
+    let mut io = hyper_util::rt::TokioIo::new(upgraded);
+    io.write_all(b"hello world").await.unwrap();
+    io.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    io.read_to_end(&mut buf).await.unwrap();
+
+    // Wait for the tunnel to close so bytes are recorded
+    wait_for_event(&log, "tunnel closed", EVENT_TIMEOUT).await;
+
+    // Second connection: should be denied with 429
+    let req2 = Request::connect(&dest).body(Empty::<bytes::Bytes>::new()).unwrap();
+    let resp2 = send_req.send_request(req2).await.unwrap();
+    assert_eq!(resp2.status(), 429, "second connection should be rate limited");
 }
