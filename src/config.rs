@@ -11,6 +11,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub observability: ObservabilityConfig,
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +42,26 @@ pub struct PolicyConfig {
     pub query_timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bytes_per_window: u64,
+    pub window_secs: Option<u64>,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bytes_per_window: 0,
+            window_secs: None,
+        }
+    }
+}
+
 impl Config {
     /// Load, parse, and validate a TOML config file.
     ///
@@ -62,6 +84,7 @@ impl Config {
 
         policy::parse_client_ext_oid(&self.policy.client_ext_oid)?;
         self.policy.validate()?;
+        self.rate_limit.validate()?;
         Ok(())
     }
 }
@@ -151,6 +174,24 @@ impl PolicyConfig {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl RateLimitConfig {
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        Duration::from_secs(self.window_secs.unwrap_or(3600))
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.enabled {
+            anyhow::ensure!(
+                self.bytes_per_window > 0,
+                "rate_limit.bytes_per_window must be greater than zero when rate limiting is enabled"
+            );
+        }
+        ensure_positive_timeout(self.window_secs, "rate_limit.window_secs")?;
         Ok(())
     }
 }

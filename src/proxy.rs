@@ -21,6 +21,7 @@ use tracing::{Instrument, error, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::policy::{self, PolicyDecision, PolicyEngine, RequestContext};
+use crate::rate_limit::RateLimiter;
 
 type ProxyBody = BoxBody<Bytes, Infallible>;
 
@@ -43,6 +44,7 @@ fn extract_trace_context(headers: &HeaderMap) -> opentelemetry::Context {
 #[derive(Clone)]
 pub struct ProxyService {
     policy_engine: Arc<dyn PolicyEngine>,
+    rate_limiter: Arc<RateLimiter>,
     peer_certs: Vec<CertificateDer<'static>>,
     source_peer_addr: SocketAddr,
 }
@@ -50,11 +52,13 @@ pub struct ProxyService {
 impl ProxyService {
     fn new(
         policy_engine: Arc<dyn PolicyEngine>,
+        rate_limiter: Arc<RateLimiter>,
         peer_certs: Vec<CertificateDer<'static>>,
         source_peer_addr: SocketAddr,
     ) -> Self {
         Self {
             policy_engine,
+            rate_limiter,
             peer_certs,
             source_peer_addr,
         }
@@ -93,6 +97,15 @@ impl ProxyService {
                         policy_decision = "allow",
                         "CONNECT allowed"
                     );
+                    if !self.rate_limiter.is_allowed(&source_identity) {
+                        log_denial(
+                            Some(&source_identity),
+                            self.source_peer_addr,
+                            &dest.authority,
+                            "rate limit exceeded",
+                        );
+                        return response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
+                    }
                     source_identity
                 }
                 PolicyDecision::Deny {
@@ -132,6 +145,7 @@ impl ProxyService {
                 source_identity,
                 self.source_peer_addr,
                 dest.authority,
+                self.rate_limiter.clone(),
             );
 
             response(StatusCode::OK, "")
@@ -154,11 +168,12 @@ impl Service<Request<Incoming>> for ProxyService {
 
 pub struct MakeProxyService {
     policy_engine: Arc<dyn PolicyEngine>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl MakeProxyService {
-    pub fn new(policy_engine: Arc<dyn PolicyEngine>) -> Self {
-        Self { policy_engine }
+    pub fn new(policy_engine: Arc<dyn PolicyEngine>, rate_limiter: Arc<RateLimiter>) -> Self {
+        Self { policy_engine, rate_limiter }
     }
 
     #[must_use]
@@ -167,7 +182,12 @@ impl MakeProxyService {
         peer_certs: Vec<CertificateDer<'static>>,
         source_peer_addr: SocketAddr,
     ) -> ProxyService {
-        ProxyService::new(self.policy_engine.clone(), peer_certs, source_peer_addr)
+        ProxyService::new(
+            self.policy_engine.clone(),
+            self.rate_limiter.clone(),
+            peer_certs,
+            source_peer_addr,
+        )
     }
 }
 
@@ -210,6 +230,7 @@ fn spawn_tunnel(
     source_identity: String,
     source_peer_addr: SocketAddr,
     dest_authority: String,
+    rate_limiter: Arc<RateLimiter>,
 ) {
     let tunnel_span = tracing::Span::current();
     tokio::spawn(
@@ -232,6 +253,7 @@ fn spawn_tunnel(
 
             match copy_bidirectional(&mut downstream, &mut upstream).await {
                 Ok((up, down)) => {
+                    rate_limiter.record_bytes(&source_identity, up.saturating_add(down));
                     info!(
                         source_identity = %source_identity,
                         source_peer_addr = %source_peer_addr,
